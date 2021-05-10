@@ -2,13 +2,15 @@ import logging
 
 import torch
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss, MSELoss
 
-from .adapter_config import DEFAULT_ADAPTER_CONFIG, AdapterType
+from .adapter_config import DEFAULT_ADAPTER_CONFIG, AdapterType, EmbeddingsConfig
 from .adapter_model_mixin import ModelAdaptersMixin, ModelWithHeadsAdaptersMixin
 from .adapter_modeling import Activation_Function_Class, Adapter, BertFusion, GLOWCouplingBlock, NICECouplingBlock
 from .adapter_utils import parse_adapter_names
 
+
+BertLayerNorm = torch.nn.LayerNorm
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,69 @@ def get_fusion_regularization_loss(model):
                 reg_loss += 0.01 * (target - layer_fusion.value.weight).pow(2).sum()
 
     return reg_loss
+
+
+def map_albert_a_embeddings_into_b(h,w, a_tokenizer, b_embeddings, b_tokenizer, device):
+
+    h = torch.tensor(h, dtype=torch.float).to(device)
+    w = torch.tensor(w, dtype=torch.float).to(device)
+
+    b_embeddings.up_projection.weight.data = h.t()
+
+    a_vocab = a_tokenizer.get_vocab()
+    counter = 0
+    for token, b_position in b_tokenizer.get_vocab().items():
+        if token in a_vocab:
+            counter += 1
+            a_position = a_vocab[token]
+            b_embeddings.word_embeddings.weight.data[b_position] = w[a_position]
+    print(f'We have found {counter} original tokens and replaced their representations.')
+    return b_embeddings
+
+
+def map_a_embeddings_into_b(a_embeddings, a_tokenizer, b_embeddings, b_tokenizer):
+
+    a_vocab =  a_tokenizer.get_vocab()
+    counter = 0
+    for token, b_position in b_tokenizer.get_vocab().items():
+        if token in a_vocab:
+            counter += 1
+            a_position = a_vocab[token]
+            b_embeddings.word_embeddings.weight.data[b_position] = a_embeddings.word_embeddings.weight[a_position].data.clone()
+    print(f'We have found {counter} original tokens and replaced their representations.')
+    return b_embeddings
+
+
+def tie_albert_weights(model, tie_down=True):
+    """ Tie or clone module weights depending of whether we are using TorchScript or not
+    """
+    output_embeddings = model.cls.predictions.decoder
+    input_embeddings = model.base_model.embeddings.word_embeddings
+    output_embeddings.weight = input_embeddings.weight
+
+    if getattr(output_embeddings, "bias", None) is not None:
+        output_embeddings.bias.data = torch.nn.functional.pad(
+            output_embeddings.bias.data,
+            (0, output_embeddings.weight.shape[0] - output_embeddings.bias.shape[0],),
+            "constant",
+            0,
+        )
+    if hasattr(output_embeddings, "out_features") and hasattr(input_embeddings, "num_embeddings"):
+        output_embeddings.out_features = input_embeddings.num_embeddings
+
+    if tie_down:
+        down = model.cls.predictions.down
+        up = model.base_model.embeddings.up_projection
+        down.weight = up.weight
+
+        if getattr(down, "bias", None) is not None:
+            down.bias.data = torch.nn.functional.pad(
+                down.bias.data,
+                (0, down.weight.shape[1] - down.bias.shape[0],),
+                "constant",
+                0,
+            )
+
 
 
 class BertSelfOutputAdaptersMixin:
@@ -112,19 +177,19 @@ class BertSelfOutputAdaptersMixin:
         query = None
 
         if adapter_config["residual_before_ln"]:
-            residual = hidden_states
+            residual = hidden_states * 1.0
 
         if hasattr(self.config, "adapter_fusion") and self.config.adapter_fusion["query_before_ln"]:
-            query = hidden_states
+            query = hidden_states * 1.0
 
         if adapter_config["original_ln_before"]:
             hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
         if not adapter_config["residual_before_ln"]:
-            residual = hidden_states
+            residual = hidden_states * 1.0
 
         if hasattr(self.config, "adapter_fusion") and not self.config.adapter_fusion["query_before_ln"]:
-            query = hidden_states
+            query = hidden_states * 1.0
 
         return hidden_states, query, residual
 
@@ -195,7 +260,7 @@ class BertSelfOutputAdaptersMixin:
 
         """
 
-        up_list = []
+        up_list = [hidden_states]
 
         for adapter_name in adapter_stack:
             adapter_layer = self.get_adapter_layer(adapter_name)
@@ -318,19 +383,19 @@ class BertOutputAdaptersMixin:
         query = None
 
         if adapter_config["residual_before_ln"]:
-            residual = hidden_states
+            residual = hidden_states * 1.0
 
         if hasattr(self.config, "adapter_fusion") and self.config.adapter_fusion["query_before_ln"]:
-            query = hidden_states
+            query = hidden_states * 1.0
 
         if adapter_config["original_ln_before"]:
             hidden_states = self.LayerNorm(hidden_states + input_tensor)
 
         if not adapter_config["residual_before_ln"]:
-            residual = hidden_states
+            residual = hidden_states * 1.0
 
         if hasattr(self.config, "adapter_fusion") and not self.config.adapter_fusion["query_before_ln"]:
-            query = hidden_states
+            query = hidden_states * 1.0
 
         return hidden_states, query, residual
 
@@ -400,7 +465,7 @@ class BertOutputAdaptersMixin:
         Returns: hidden_states
 
         """
-        up_list = []
+        up_list = [hidden_states]
 
         for adapter_name in adapter_stack:
             adapter_layer = self.get_adapter_layer(adapter_name)
@@ -419,6 +484,76 @@ class BertOutputAdaptersMixin:
                 query, up_list, up_list, residual=residual, attention_mask=attention_mask
             )
         return hidden_states
+
+    # def adapters_forward(self, hidden_states, input_tensor, attention_mask, adapter_names=None):
+    #
+    #     residual = hidden_states * 1.0
+    #     hidden_states = self.LayerNorm(hidden_states + input_tensor)
+    #
+    #     # if hasattr(self.config, 'language_adapter_config') and \
+    #     #         self.config.language_adapter_config['Output_Adapter'] and \
+    #     #         self.language_adapters_enabled:
+    #
+    #     hidden_states, down, up = self.layer_text_lang_adapters[adapter_names[0][0]](
+    #         hidden_states,
+    #         residual_input=residual
+    #     )
+    #     residual = hidden_states
+    #
+    #     hidden_states = self.LayerNorm(hidden_states + input_tensor)
+    #
+    #     # if hasattr(self.config, 'adapter_config') and self.config.adapter_config[
+    #     #     'Output_Adapter'] and self.adapters_enabled:
+    #     #     if tasks is None:
+    #     #         raise Exception('No tasks given, but adapters are active. Deactivate adapters?')
+    #
+    #     hidden_states, down, up = self.layer_text_task_adapters[adapter_names[1][0]](
+    #         hidden_states,
+    #         residual_input=residual
+    #     )
+    #
+    #     hidden_states = self.LayerNorm(hidden_states + input_tensor)
+    #
+    #     return hidden_states
+
+
+
+
+
+
+
+
+
+        # if adapter_names is not None:
+        #     adapter_names = parse_adapter_names(adapter_names)
+        #
+        #     flat_adapter_names = [item for sublist in adapter_names for item in sublist]
+        #
+        # if adapter_names is not None and (
+        #     len(
+        #         (set(self.layer_text_lang_adapters.keys()) | set(self.layer_text_task_adapters.keys()))
+        #         & set(flat_adapter_names)
+        #     )
+        #     > 0
+        # ):
+        #
+        #     for adapter_stack in adapter_names:
+        #         hidden_states = self.adapter_stack_layer(
+        #             hidden_states=hidden_states,
+        #             input_tensor=input_tensor,
+        #             attention_mask=attention_mask,
+        #             adapter_stack=adapter_stack,
+        #         )
+        #
+        #     last_config = self.config.adapters.get(adapter_names[-1][-1])
+        #     if last_config["original_ln_after"]:
+        #         hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        #
+        # else:
+        #     hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        #
+        # return hidden_states
+
 
     def adapters_forward(self, hidden_states, input_tensor, attention_mask, adapter_names=None):
 
@@ -480,7 +615,10 @@ class BertEncoderAdaptersMixin:
 
     def add_adapter(self, adapter_name: str, adapter_type: AdapterType):
         adapter_config = self.config.adapters.get(adapter_name)
-        leave_out = adapter_config.get("leave_out", [])
+        if hasattr(adapter_config, "leave_out"):
+            leave_out = adapter_config.leave_out
+        else:
+            leave_out = []
         for i, layer in enumerate(self.layer):
             if i not in leave_out:
                 layer.add_adapter(adapter_name, adapter_type)
@@ -503,7 +641,7 @@ class BertModelAdaptersMixin(ModelAdaptersMixin):
         # language adapters
         for language in self.config.adapters.adapter_list(AdapterType.text_lang):
             self.encoder.add_adapter(language, AdapterType.text_lang)
-            self.add_invertible_lang_adapter(language)
+            #self.add_invertible_lang_adapter(language)
         # task adapters
         for task in self.config.adapters.adapter_list(AdapterType.text_task):
             self.encoder.add_adapter(task, AdapterType.text_task)
@@ -511,6 +649,9 @@ class BertModelAdaptersMixin(ModelAdaptersMixin):
         if hasattr(self.config, "fusion_models"):
             for fusion_adapter_names in self.config.fusion_models:
                 self.add_fusion_layer(fusion_adapter_names)
+
+    def set_embeddings_config(self, args):
+        self.config.embeddings = EmbeddingsConfig(**args).to_dict()
 
     def train_adapter(self, adapter_names: list):
         """Sets the model in mode for training the given adapters."""
@@ -547,7 +688,7 @@ class BertModelAdaptersMixin(ModelAdaptersMixin):
             self.config.adapters.set_config(adapter_type, config or DEFAULT_ADAPTER_CONFIG)
         self.config.adapters.add(adapter_name, adapter_type, config=config)
         self.encoder.add_adapter(adapter_name, adapter_type)
-        if adapter_type == AdapterType.text_lang:
+        if adapter_type == AdapterType.text_lang and self.config.adapters.get(adapter_name)['invertible_adapter'] is not None:
             self.add_invertible_lang_adapter(adapter_name)
 
     def add_invertible_lang_adapter(self, language):
@@ -629,7 +770,7 @@ class BertModelHeadsMixin(ModelWithHeadsAdaptersMixin):
         self.active_adapter_names = new_adapter_names
 
     def add_classification_head(
-        self, head_name, num_labels=2, layers=2, activation_function="tanh", overwrite_ok=False, multilabel=False
+        self, head_name, num_labels=2, layers=2, activation_function="tanh", overwrite_ok=False,
     ):
         """Adds a sequence classification head on top of the model.
 
@@ -639,15 +780,9 @@ class BertModelHeadsMixin(ModelWithHeadsAdaptersMixin):
             layers (int, optional): Number of layers. Defaults to 2.
             activation_function (str, optional): Activation function. Defaults to 'tanh'.
             overwrite_ok (bool, optional): Force overwrite if a head with the same name exists. Defaults to False.
-            multilabel (bool, optional): Enable multilabel classification setup. Defaults to False.
         """
-        if multilabel:
-            head_type = "multilabel_classification"
-        else:
-            head_type = "classification"
-
         config = {
-            "head_type": head_type,
+            "head_type": "classification",
             "num_labels": num_labels,
             "layers": layers,
             "activation_function": activation_function,
@@ -754,17 +889,6 @@ class BertModelHeadsMixin(ModelWithHeadsAdaptersMixin):
                 else:
                     loss_fct = CrossEntropyLoss()
                     loss = loss_fct(logits.view(-1, head["num_labels"]), labels.view(-1))
-                outputs = (loss,) + outputs
-
-        elif head["head_type"] == "multilabel_classification":
-            logits = self.heads[head_name](sequence_output[:, 0])
-
-            outputs = (logits,) + outputs[2:]
-            if labels is not None:
-                loss_fct = BCEWithLogitsLoss()
-                if labels.dtype != torch.float32:
-                    labels = labels.float()
-                loss = loss_fct(logits, labels)
                 outputs = (loss,) + outputs
 
         elif head["head_type"] == "multiple_choice":

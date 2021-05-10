@@ -3,7 +3,7 @@ import logging
 from abc import ABC, abstractmethod
 from os import mkdir
 from os.path import exists, isdir, isfile, join
-from typing import Callable, List, Mapping, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -25,6 +25,8 @@ from .adapter_utils import (
     WEIGHTS_NAME,
     inherit_doc,
     resolve_adapter_path,
+    EMBEDDINGS_WEIGHTS_NAME,
+    EMBEDDINGS_CONFIG_NAME
 )
 
 
@@ -145,11 +147,11 @@ class WeightsLoaderHelper:
 
         missing_keys = [k for k in missing_keys if filter_func(k)]
         if len(missing_keys) > 0:
-            logger.info(
+            logger.warning(
                 "Some module weights could not be found in loaded weights file: {}".format(", ".join(missing_keys))
             )
         if len(unexpected_keys) > 0:
-            logger.info(
+            logger.warning(
                 "Some weights of the state_dict could not be loaded into model: {}".format(", ".join(unexpected_keys))
             )
 
@@ -433,7 +435,7 @@ class AdapterFusionLoader(WeightsLoader):
                 if self.error_on_missing:
                     raise ValueError(f"Unknown AdapterFusion '{name}'.")
                 else:
-                    logger.debug(f"No AdapterFusion with name '{name}' available.")
+                    logger.info(f"No AdapterFusion with name '{name}' available.")
                     return
 
         if not exists(save_directory):
@@ -472,7 +474,7 @@ class AdapterFusionLoader(WeightsLoader):
             if self.error_on_missing:
                 raise ValueError("Loading path should be a directory where AdapterFusion is saved.")
             else:
-                logger.debug("No matching adapter fusion found in '{}'".format(save_directory))
+                logger.info("No matching prediction head found in '{}'".format(save_directory))
                 return None, None
 
         config = self.weights_helper.load_weights_config(save_directory)
@@ -532,7 +534,7 @@ class PredictionHeadLoader(WeightsLoader):
                     if self.error_on_missing:
                         raise ValueError(f"Unknown head_name '{name}'.")
                     else:
-                        logger.debug(f"No prediction head with name '{name}' available.")
+                        logger.info(f"No prediction head with name '{name}' available.")
                         return
             else:
                 # we haven't found a prediction head configuration, so we assume there is only one (unnamed) head
@@ -595,7 +597,7 @@ class PredictionHeadLoader(WeightsLoader):
                         f"model class."
                     )
                 else:
-                    logger.debug("No matching prediction head found in '{}'".format(save_directory))
+                    logger.info("No matching prediction head found in '{}'".format(save_directory))
                     return None, None
             if hasattr(self.model.config, "prediction_heads"):
                 head_name = load_as or config["name"]
@@ -614,6 +616,111 @@ class PredictionHeadLoader(WeightsLoader):
         )
 
         return save_directory, head_name
+
+
+class EmbeddingsLoader(WeightsLoader):
+    """
+    A class providing methods for saving and loading prediction head modules from the file system.
+
+    Model classes supporting configurable head modules via config files should provide
+    a prediction head config at `model.config.prediction_heads` and a method `add_prediction_head(head_name, config)`.
+    """
+
+    def __init__(self, model, error_on_missing=True):
+        super().__init__(model, EMBEDDINGS_WEIGHTS_NAME, EMBEDDINGS_CONFIG_NAME)
+        self.error_on_missing = error_on_missing
+
+    def filter_func(self):
+
+        return lambda x: "embeddings" in x
+
+
+    def rename_func(self, old_name, new_name):
+        return lambda k: k.replace("embedding", "embeddings")
+
+    def save(self, save_directory: str, name: str = None):
+        """Saves a prediction head module into the given directory.
+
+        Args:
+            save_directory (str): The directory to save the weights in.
+            name (str, optional): The prediction head name.
+        """
+
+        if not exists(save_directory):
+            mkdir(save_directory)
+        else:
+            assert isdir(save_directory), "Saving path should be a directory where the head can be saved."
+
+        # # if we use a custom head, save it
+        # if name and hasattr(self.model.config, "embeddings"):
+        embedding_config = self.model.config.embeddings
+        # else:
+        #     head_config = None
+
+        # Save the adapter configuration
+        config_dict = build_full_config(
+            embedding_config,
+            self.model.config,
+            name=name,
+            model_name=self.model.model_name,
+            model_class=self.model.__class__.__name__,
+        )
+        self.weights_helper.save_weights_config(save_directory, config_dict)
+
+        # Save head weights
+        filter_func = self.filter_func()
+        self.weights_helper.save_weights(save_directory, filter_func)
+
+    def load(self, save_directory, load_as=None, loading_info=None):
+        """Loads a prediction head module from the given directory.
+
+        Args:
+            save_directory (str): The directory from where to load the weights.
+            load_as (str, optional): Load the weights with this name. Defaults to None.
+
+        Returns:
+            Tuple[str, str]: A tuple consisting of the local file system directory from which the weights where loaded
+                             and the name of the loaded weights.
+        """
+        if not exists(join(save_directory, EMBEDDINGS_WEIGHTS_NAME)):
+            if self.error_on_missing:
+                raise ValueError("Loading path should be a directory where the head is saved.")
+            else:
+                logger.info("No matching prediction head found in '{}'".format(save_directory))
+                return None, None
+
+        # head_name = None
+
+        # Load head config if available - otherwise just blindly try to load the weights
+        # if isfile(join(save_directory, EMBEDDINGS_CONFIG_NAME)):
+        #     config = self.weights_helper.load_weights_config(save_directory)
+            # make sure that the model class of the loaded head matches the current class
+            # if self.model.__class__.__name__ != config["model_class"]:
+            #     if self.error_on_missing:
+            #         raise ValueError(
+            #             f"Model class '{config['model_class']}' of found prediction head does not match current "
+            #             f"model class."
+            #         )
+            #     else:
+            #         logger.info("No matching embeddings found in '{}'".format(save_directory))
+            #         return None, None
+            # if hasattr(self.model.config, "embeddings"):
+            #
+            #     if head_name in self.model.config.prediction_heads:
+            #         logger.warning("Overwriting existing head '{}'".format(head_name))
+            #     self.model.add_prediction_head(head_name, config["config"], overwrite_ok=True)
+
+        # Load head weights
+        filter_func = self.filter_func()
+        # if load_as:
+        #     rename_func = self.rename_func(config["name"], load_as)
+        # else:
+        rename_func = None
+        self.weights_helper.load_weights(
+            save_directory, filter_func, rename_func=rename_func, loading_info=loading_info
+        )
+
+        return save_directory, None
 
 
 class ModelAdaptersMixin(ABC):
@@ -678,7 +785,9 @@ class ModelAdaptersMixin(ABC):
         if isinstance(adapter_fusion_config, str) and adapter_fusion_config in ADAPTERFUSION_CONFIG_MAP:
             self.config.adapter_fusion = AdapterFusionConfig.load(adapter_fusion_config, **kwargs)
             # ADAPTERFUSION_CONFIG_MAP[adapter_fusion_config](**kwargs).to_dict()
-        elif isinstance(adapter_fusion_config, Mapping):
+        elif isinstance(adapter_fusion_config, AdapterFusionConfig):
+            self.config.adapter_fusion = adapter_fusion_config.to_dict()
+        elif isinstance(adapter_fusion_config, dict):
             self.config.adapter_fusion = adapter_fusion_config
         else:
             raise ValueError("Invalid adapter type {}".format(adapter_fusion_config))
@@ -956,6 +1065,7 @@ class ModelWithHeadsAdaptersMixin(ModelAdaptersMixin):
         model_name: str = None,
         load_as: str = None,
         with_head: bool = True,
+        with_embeddings: bool = False,
         custom_weights_loaders: Optional[List[WeightsLoader]] = None,
         **kwargs
     ) -> str:
@@ -963,6 +1073,10 @@ class ModelWithHeadsAdaptersMixin(ModelAdaptersMixin):
             if custom_weights_loaders is None:
                 custom_weights_loaders = []
             custom_weights_loaders.append(PredictionHeadLoader(self, error_on_missing=False))
+        if with_embeddings:
+            if custom_weights_loaders is None:
+                custom_weights_loaders = []
+            custom_weights_loaders.append(EmbeddingsLoader(self, error_on_missing=False))
         return super().load_adapter(
             adapter_name_or_path,
             adapter_type=adapter_type,
@@ -979,12 +1093,17 @@ class ModelWithHeadsAdaptersMixin(ModelAdaptersMixin):
         save_directory: str,
         with_head: bool = True,
         meta_dict: dict = None,
+        with_embeddings: bool = False,
         custom_weights_loaders: Optional[List[WeightsLoader]] = None,
     ):
         if with_head:
             if custom_weights_loaders is None:
                 custom_weights_loaders = []
             custom_weights_loaders.append(PredictionHeadLoader(self, error_on_missing=False))
+        if with_embeddings:
+            if custom_weights_loaders is None:
+                custom_weights_loaders = []
+            custom_weights_loaders.append(EmbeddingsLoader(self, error_on_missing=False))
         super().save_all_adapters(
             save_directory, meta_dict=meta_dict, custom_weights_loaders=custom_weights_loaders,
         )

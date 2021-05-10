@@ -233,6 +233,10 @@ class Trainer:
             # We'll find a more elegant and not need to do this in the future.
             self.model.config.xla_device = True
 
+        # for finding the best model.
+        # TODO: assumes higher is better
+        self.best_score = 0.0
+
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -489,9 +493,9 @@ class Trainer:
                     and (step + 1) == len(epoch_iterator)
                 ):
                     # apply adapter fusion weight regularization on the value matrix
-                    if hasattr(model.config, "adapter_fusion") and model.config.adapter_fusion["regularization"]:
-                        fusion_reg_loss = get_fusion_regularization_loss(model)
-                        fusion_reg_loss.backward()
+                    #if hasattr(model.config, "adapter_fusion") and model.config.adapter_fusion["regularization"]:
+                    #    fusion_reg_loss = get_fusion_regularization_loss(model)
+                    #    fusion_reg_loss.backward()
 
                     if self.args.fp16:
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.args.max_grad_norm)
@@ -654,6 +658,9 @@ class Trainer:
             self.model.save_all_adapter_fusions(output_dir)
         if self.do_save_full_model:
             self.model.save_pretrained(output_dir)
+            if len(self.model.config.adapters.adapters) > 0:
+                for k,v in self.model.config.adapters.adapters.items():
+                    self.model.base_model.save_adapter(save_directory=os.path.join(output_dir,k), adapter_name=k, save_head=False, meta_dict=None)
 
     def _save(self, output_dir: Optional[str] = None):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
@@ -725,6 +732,9 @@ class Trainer:
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
         output = self._prediction_loop(eval_dataloader, description="Evaluation")
+        
+        if self.args.store_best_model:
+            self.store_best_model(output)
 
         self._log(output.metrics)
 
@@ -733,6 +743,20 @@ class Trainer:
             xm.master_print(met.metrics_report())
 
         return output.metrics
+
+    def store_best_model(self, output):
+
+        if self.args.metric_score not in output.metrics:
+            raise Exception("Metric %s not in output.\nThe following output was generated: %s", str(self.args.metric_score), str(output))
+
+        if output.metrics[self.args.metric_score] > self.best_score:
+
+            self.best_score = output.metrics[self.args.metric_score]
+            # Save model checkpoint
+            self.save_model(os.path.join(self.args.output_dir, "best_model"))
+            with open(os.path.join(self.args.output_dir, "best_model", "output.txt"), 'w') as f:
+                f.write(str(output.metrics))
+
 
     def predict(self, test_dataset: Dataset) -> PredictionOutput:
         """

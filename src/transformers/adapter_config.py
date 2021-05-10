@@ -6,7 +6,7 @@ from dataclasses import FrozenInstanceError, asdict, dataclass, field, is_datacl
 from os.path import isfile
 from typing import List, Optional, Union
 
-from .adapter_utils import AdapterType, get_adapter_config_hash, resolve_adapter_config
+from .adapter_utils import AdapterType, DataclassJSONEncoder, get_adapter_config_hash, resolve_adapter_config
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,10 @@ class AdapterConfig(Mapping):
     reduction_factor: int
     invertible_adapter: Optional[InvertibleAdapterConfig] = None
     leave_out: List[int] = field(default_factory=list)
+
+    # unused but to mitigate dumps
+    attention_type: Optional[str] = None
+    new_attention_norm: Optional[str] = None
 
     # We want to emulate a simple form of immutability while keeping the ability to add custom attributes.
     # Therefore, we don't allow changing attribute values if set once.
@@ -134,7 +138,7 @@ class PfeifferConfig(AdapterConfig):
     non_linearity: str = "relu"
     reduction_factor: int = 16
     invertible_adapter: Optional[dict] = InvertibleAdapterConfig(
-        block_type="nice", non_linearity="relu", reduction_factor=2
+        block_type="nice", non_linearity=non_linearity, reduction_factor=2
     )
 
 
@@ -155,6 +159,9 @@ class HoulsbyConfig(AdapterConfig):
     output_adapter: bool = True
     non_linearity: str = "swish"
     reduction_factor: int = 16
+    invertible_adapter: Optional[dict] = InvertibleAdapterConfig(
+        block_type="nice", non_linearity=non_linearity, reduction_factor=2
+    )
 
 
 ADAPTER_CONFIG_MAP = {"pfeiffer": PfeifferConfig(), "houlsby": HoulsbyConfig()}
@@ -249,6 +256,8 @@ class ModelAdaptersConfig:
     def to_dict(self):
         output_dict = {}
         output_dict["adapters"] = copy.deepcopy(self.adapters)
+        # make sure all config objects are serializable
+        output_dict["config_map"] = json.loads(json.dumps(self.config_map, cls=DataclassJSONEncoder))
         return output_dict
 
 
@@ -368,3 +377,93 @@ class DynamicAdapterFusionConfig(AdapterFusionConfig):
 ADAPTERFUSION_CONFIG_MAP = {"static": StaticAdapterFusionConfig(), "dynamic": DynamicAdapterFusionConfig()}
 
 DEFAULT_ADAPTERFUSION_CONFIG = "dynamic"
+
+
+@dataclass
+class EmbeddingsConfig(Mapping):
+    """Base class that models the architecture of an adapter."""
+
+    type: str = 'full'
+    dimensionality: Optional[int] = None
+    vocab_size: Optional[int] = None
+
+    # We want to emulate a simple form of immutability while keeping the ability to add custom attributes.
+    # Therefore, we don't allow changing attribute values if set once.
+    def __setattr__(self, name, value):
+        if name in self.__dict__:
+            raise FrozenInstanceError()
+        else:
+            object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        raise FrozenInstanceError()
+
+    def __getitem__(self, key):
+        return self.__dict__[key]
+
+    def __iter__(self):
+        return iter(self.__dict__)
+
+    def __len__(self):
+        return len(self.__dict__)
+
+    def to_dict(self):
+        return asdict(self)
+
+    def replace(self, **changes):
+        return replace(self, **changes)
+
+    @classmethod
+    def from_dict(cls, config):
+        return cls(**config)
+
+    @classmethod
+    def load(cls, config: Union[dict, str], **kwargs):
+        """Loads a given adapter configuration specifier into a full AdapterConfig instance.
+
+        Args:
+            config (Union[dict, str]): The configuration to load. Can be either:
+                - a dictionary representing the full config
+                - an identifier string available in ADAPTER_CONFIG_MAP
+                - the path to a file containing a full adapter configuration
+                - an identifier string available in Adapter-Hub
+
+        Returns:
+            dict: The resolved adapter configuration dictionary.
+        """
+        # currently storing AdapterFusion weights on AdapterHub is not supported.
+        config_dict = resolve_adapter_config(config, local_map=EMBEDDINGS_CONFIG_MAP, try_loading_from_hub=False)
+        # convert back to dict to allow attr overrides
+        if isinstance(config_dict, EmbeddingsConfig):
+            config_dict = config_dict.to_dict()
+        config_dict.update(kwargs)
+        return EmbeddingsConfig.from_dict(config_dict)
+
+
+@dataclass
+class FullEmbeddingsConfig(EmbeddingsConfig):
+    """
+    The adapter architecture proposed by Houlsby et. al., 2019.
+    Described in https://arxiv.org/pdf/1902.00751.pdf.
+    """
+
+    type: str = 'full'
+
+
+@dataclass
+class AlbertEmbeddingsConfig(EmbeddingsConfig):
+    """
+    The adapter architecture proposed by Houlsby et. al., 2019.
+    Described in https://arxiv.org/pdf/1902.00751.pdf.
+    """
+
+    type: str = 'albert'
+    dimensionality: Optional[int] = 100
+
+
+EMBEDDINGS_CONFIG_MAP = {"full": FullEmbeddingsConfig(), "albert": AlbertEmbeddingsConfig()}
+
+DEFAULT_EMBEDDINGS_CONFIG = "full"
+
+
+
