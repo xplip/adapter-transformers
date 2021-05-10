@@ -155,7 +155,6 @@ if is_torch_available():
         WeightsLoaderHelper,
         WeightsLoader,
         AdapterLoader,
-        AdapterFusionLoader,
         PredictionHeadLoader,
         ModelAdaptersMixin,
         ModelWithHeadsAdaptersMixin,

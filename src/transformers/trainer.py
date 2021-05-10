@@ -236,6 +236,7 @@ class Trainer:
         # for finding the best model.
         # TODO: assumes higher is better
         self.best_score = 0.0
+        self.eval_steps_without_improvement = 0
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -553,10 +554,10 @@ class Trainer:
                             torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                             torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
 
-                if self.args.max_steps > 0 and self.global_step > self.args.max_steps:
+                if (self.args.max_steps > 0 and self.global_step > self.args.max_steps) or self.eval_steps_without_improvement > 4:
                     epoch_iterator.close()
                     break
-            if self.args.max_steps > 0 and self.global_step > self.args.max_steps:
+            if (self.args.max_steps > 0 and self.global_step > self.args.max_steps) or self.eval_steps_without_improvement > 4:
                 train_iterator.close()
                 break
             if self.args.tpu_metrics_debug:
@@ -752,11 +753,16 @@ class Trainer:
         if output.metrics[self.args.metric_score] > self.best_score:
 
             self.best_score = output.metrics[self.args.metric_score]
+            self.eval_steps_without_improvement = 0
             # Save model checkpoint
             self.save_model(os.path.join(self.args.output_dir, "best_model"))
             with open(os.path.join(self.args.output_dir, "best_model", "output.txt"), 'w') as f:
                 f.write(str(output.metrics))
-
+        else:
+            self.eval_steps_without_improvement += 1
+            logger.info("Number of eval steps without improvement: %d", self.eval_steps_without_improvement)
+            if self.eval_steps_without_improvement > 4:
+                logger.info("%d eval steps have passed without improvement. Early stopping training", self.eval_steps_without_improvement)
 
     def predict(self, test_dataset: Dataset) -> PredictionOutput:
         """

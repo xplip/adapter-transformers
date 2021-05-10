@@ -651,6 +651,44 @@ class BertModel(BertModelAdaptersMixin, BertPreTrainedModel):
 
         self.init_weights()
 
+    def map_a_special_embeddings_into_b(self, a_embeddings, a_tokenizer, b_embeddings, b_tokenizer):
+        a_vocab = a_tokenizer.get_vocab()
+        counter = 0
+        for token, b_position in zip(b_tokenizer.all_special_tokens, b_tokenizer.all_special_ids):
+            if token in a_vocab:
+                counter += 1
+                a_position = a_vocab[token]
+                b_embeddings.word_embeddings.weight.data[b_position] = a_embeddings.word_embeddings.weight[
+                    a_position].data.clone()
+        logger.info(f'We have found {counter} original tokens and replaced their representations.')
+        return b_embeddings
+
+    def overwrite_embeddings(self, args=None, a_tokenizer=None, b_tokenizer=None):
+        if hasattr(self.config, 'embeddings_type'):
+            if self.config.embeddings_type == 'full':
+                new_embeddings = BertEmbeddings(self.config)
+                new_embeddings.apply(self._init_weights)
+                if a_tokenizer is not None and b_tokenizer  is not None:
+                    a_embeddings = self.embeddings
+                    new_embeddings = self.map_a_special_embeddings_into_b(a_embeddings=a_embeddings,
+                                                     a_tokenizer=a_tokenizer,
+                                                     b_embeddings=new_embeddings,
+                                                     b_tokenizer=b_tokenizer)
+
+            if a_tokenizer is not None and b_tokenizer is not None:
+                new_embeddings.position_embeddings = self.embeddings.position_embeddings
+                new_embeddings.token_type_embeddings = self.embeddings.token_type_embeddings
+                new_embeddings.LayerNorm = self.embeddings.LayerNorm
+                new_embeddings = new_embeddings.to(self.device)
+
+            self.embeddings = new_embeddings
+            self.vocab_size = b_tokenizer.vocab_size
+        else:
+            logger.warning("No embeddings_type set.")
+
+    def set_embeddings_type(self, embeddings_type):
+        self.config.embeddings_type = embeddings_type
+
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
 
@@ -1600,3 +1638,4 @@ class BertForQuestionAnswering(ModelWithHeadsAdaptersMixin, BertPreTrainedModel)
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
