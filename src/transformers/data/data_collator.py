@@ -1,6 +1,8 @@
+import random
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, NewType, Tuple
+from typing import Any, Dict, List, NewType, Tuple, Union
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -74,6 +76,39 @@ class DefaultDataCollator(DataCollator):
                 batch[k] = torch.tensor([getattr(f, k) for f in features], dtype=torch.long)
         return batch
 
+
+def _collate_batch(examples, tokenizer):
+    """Collate `examples` into a batch, using the information in `tokenizer` for padding if necessary."""
+    # Tensorize if necessary.
+    if isinstance(examples[0], (list, tuple)):
+        examples = [torch.tensor(e, dtype=torch.long) for e in examples]
+
+    # Check if padding is necessary.
+    length_of_first = examples[0].size(0)
+    are_tensors_same_length = all(x.size(0) == length_of_first for x in examples)
+    if are_tensors_same_length:
+        return torch.stack(examples, dim=0)
+
+    # If yes, check if we have a `pad_token`.
+    if tokenizer._pad_token is None:
+        raise ValueError(
+            "You are attempting to pad samples but the tokenizer you are using"
+            f" ({tokenizer.__class__.__name__}) does not have a pad token."
+        )
+
+    # Creating the full tensor and filling it with our data.
+    max_length = max(x.size(0) for x in examples)
+    result = examples[0].new_full([len(examples), max_length], tokenizer.pad_token_id)
+    for i, example in enumerate(examples):
+        if tokenizer.padding_side == "right":
+            result[i, : example.shape[0]] = example
+        else:
+            result[i, -example.shape[0] :] = example
+    return result
+
+
+def tolist(x: Union[List[Any], torch.Tensor]):
+    return x.tolist() if isinstance(x, torch.Tensor) else x
 
 @dataclass
 class DataCollatorForLanguageModeling(DataCollator):
@@ -151,14 +186,12 @@ class DataCollatorForWholeWordMask(DataCollatorForLanguageModeling):
     - preprocesses batches for masked language modeling
     """
 
-    def __call__(
+    def collate_batch(
         self, examples: List[Union[List[int], torch.Tensor, Dict[str, torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        if isinstance(examples[0], (dict, BatchEncoding)):
-            input_ids = [e["input_ids"] for e in examples]
-        else:
-            input_ids = examples
-            examples = [{"input_ids": e} for e in examples]
+        
+        input_ids = examples
+        examples = [{"input_ids": e} for e in examples]
 
         batch_input = _collate_batch(input_ids, self.tokenizer)
 
@@ -179,7 +212,8 @@ class DataCollatorForWholeWordMask(DataCollatorForLanguageModeling):
             mask_labels.append(self._whole_word_mask(ref_tokens))
         batch_mask = _collate_batch(mask_labels, self.tokenizer)
         inputs, labels = self.mask_tokens(batch_input, batch_mask)
-        return {"input_ids": inputs, "labels": labels}
+        
+        return {"input_ids": inputs, "masked_lm_labels": labels}
 
     def _whole_word_mask(self, input_tokens: List[str], max_predictions=512):
         """
